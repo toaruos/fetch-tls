@@ -21,7 +21,8 @@
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/error.h>
 
-#include "lib/http_parser.h"
+#include "http_parser.h"
+#include "http_parser.c"
 
 #include "certs.h"
 
