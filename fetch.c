@@ -11,9 +11,13 @@
 #include <stdlib.h>
 #include <getopt.h>
 #include <time.h>
-#include <sys/time.h>
 #include <termios.h>
 #include <unistd.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 
 #include <mbedtls/platform.h>
 #include <mbedtls/ssl.h>
@@ -179,17 +183,20 @@ static int ssl_handshake(struct http_req * r, FILE * socket) {
 	return 0;
 }
 
-
 #define BAR_WIDTH 20
 #define bar_perc "||||||||||||||||||||"
 #define bar_spac "                    "
-void print_progress(void) {
+void print_progress(int force) {
+	static uint64_t last_size = 0;
+	if (!fetch_options.show_progress) return;
+	if (!force && (last_size + 102400 > fetch_options.size)) return;
+	last_size = fetch_options.size;
 	struct timeval now;
 	gettimeofday(&now, NULL);
-	fprintf(stderr,"\033[G%6dkB",fetch_options.size/1024);
+	fprintf(stderr,"\033[?25l\033[G%6dkB",(int)fetch_options.size/1024);
 	if (fetch_options.content_length) {
 		int percent = (fetch_options.size * BAR_WIDTH) / (fetch_options.content_length);
-		fprintf(stderr," / %6dkB [%.*s%.*s]", fetch_options.content_length/1024, percent,bar_perc,BAR_WIDTH-percent,bar_spac);
+		fprintf(stderr," / %6dkB [%.*s%.*s]", (int)fetch_options.content_length/1024, percent,bar_perc,BAR_WIDTH-percent,bar_spac);
 	}
 
 	double timediff = (double)(now.tv_sec - fetch_options.start.tv_sec) + (double)(now.tv_usec - fetch_options.start.tv_usec)/1000000.0;
@@ -197,9 +204,9 @@ void print_progress(void) {
 		double rate = (double)(fetch_options.size) / timediff;
 		double s = rate/(1024.0) * 8.0;
 		if (s > 1024.0) {
-			fprintf(stderr," %.2f mbps", s/1024.0);
+			fprintf(stderr," %.2f Mbps", s/1024.0);
 		} else {
-			fprintf(stderr," %.2f kbps", s);
+			fprintf(stderr," %.2f Kbps", s);
 		}
 
 		if (fetch_options.content_length) {
@@ -210,8 +217,28 @@ void print_progress(void) {
 			}
 		}
 	}
-	fprintf(stderr,"\033[K");
+	fprintf(stderr,"\033[K\033[?25h");
 	fflush(stderr);
+}
+
+int usage(char * argv[]) {
+	fprintf(stderr,
+			"fetch - download files over HTTP/HTTPS\n"
+			"\n"
+			"usage: %s [-hOvmp?] [-c cookie] [-o file] [-u file] [-s speed] URL\n"
+			"\n"
+			" -h     \033[3mshow headers\033[0m\n"
+			" -O     \033[3msave the file based on the filename in the URL\033[0m\n"
+			" -v     \033[3mshow progress\033[0m\n"
+			" -m     \033[3mmachine readable output\033[0m\n"
+			" -p     \033[3mprompt for password\033[0m\n"
+			" -c ... \033[3mset cookies\033[0m\n"
+			" -o ... \033[3msave to the specified file\033[0m\n"
+			" -u ... \033[3mupload the specified file\033[0m\n"
+			" -s ... \033[3mspecify the speed for uploading slowly\033[0m\n"
+			" -?     \033[3mshow this help text\033[0m\n"
+			"\n", argv[0]);
+	return 1;
 }
 
 int callback_header_field (http_parser *p, const char *buf, size_t len) {
@@ -242,18 +269,11 @@ int callback_header_value (http_parser *p, const char *buf, size_t len) {
 int callback_body (http_parser *p, const char *buf, size_t len) {
 	fwrite(buf, 1, len, fetch_options.out);
 	fetch_options.size += len;
-	if (fetch_options.show_progress) {
-		print_progress();
-	}
+	print_progress(0);
 	if (fetch_options.machine_readable && fetch_options.content_length) {
 		fprintf(stdout,"%d %d\n",fetch_options.size, fetch_options.content_length);
 	}
 	return 0;
-}
-
-int usage(char * argv[]) {
-	fprintf(stderr, "Usage: %s [-h] [-c cookie] [-o file] url\n", argv[0]);
-	return 1;
 }
 
 int collect_password(char * password) {
@@ -318,9 +338,6 @@ int main(int argc, char * argv[]) {
 	struct http_req my_req;
 	parse_url(argv[optind], &my_req);
 
-	char file[100];
-	sprintf(file, "/dev/net/%s:%d", my_req.domain, my_req.port);
-
 	if (fetch_options.calculate_output) {
 		char * tmp = strdup(my_req.path);
 		char * x = strrchr(tmp,'/');
@@ -335,7 +352,30 @@ int main(int argc, char * argv[]) {
 		fetch_options.out = fopen(fetch_options.output_file, "w");
 	}
 
-	FILE * f = fopen(file,"r+");
+	int sock = socket(AF_INET, SOCK_STREAM, 0);
+	if (sock < 0) {
+		perror("socket");
+		return 1;
+	}
+
+	struct hostent * remote = gethostbyname(my_req.domain);
+
+	if (!remote) {
+		perror("gethostbyname");
+		return 1;
+	}
+
+	struct sockaddr_in addr;
+	addr.sin_family = AF_INET;
+	memcpy(&addr.sin_addr.s_addr, remote->h_addr, remote->h_length);
+	addr.sin_port = htons(my_req.port);
+
+	if (connect(sock, (struct sockaddr*)&addr, sizeof(struct sockaddr_in)) < 0) {
+		perror("connect");
+		return 1;
+	}
+
+	FILE * f = fdopen(sock,"w+");
 
 	if (!f) {
 		fprintf(stderr, "Nope.\n");
@@ -443,6 +483,7 @@ int main(int argc, char * argv[]) {
 			mbedtls_ssl_write(&_ssl, buf, r);
 		} else {
 			fwrite(buf, 1, r, f);
+			fflush(f);
 		}
 	} else {
 		char buf[1024];
@@ -456,6 +497,7 @@ int main(int argc, char * argv[]) {
 			mbedtls_ssl_write(&_ssl, buf, r);
 		} else {
 			fwrite(buf, 1, r, f);
+			fflush(f);
 		}
 	}
 
@@ -472,7 +514,7 @@ int main(int argc, char * argv[]) {
 	while (!feof(f)) {
 		char buf[10240];
 		memset(buf, 0, sizeof(buf));
-		int r;
+		size_t r;
 		if (!my_req.ssl) {
 			r = fread(buf, 1, 10240, f);
 		} else {
@@ -485,6 +527,7 @@ int main(int argc, char * argv[]) {
 	}
 
 	fflush(fetch_options.out);
+	print_progress(1);
 
 	if (fetch_options.show_progress) {
 		fprintf(stderr,"\n");
