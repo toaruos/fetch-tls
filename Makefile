@@ -4,3 +4,7 @@ LDFLAGS=-lmbedtls -lmbedx509 -lmbedcrypto
 
 all: fetch
 
+fetch-tls.tgz: fetch
+	mkdir -p pkg/usr/bin
+	cp fetch pkg/usr/bin/
+	cd pkg && tar -czvf ../$@ .

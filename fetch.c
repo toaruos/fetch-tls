@@ -18,6 +18,7 @@
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <poll.h>
 
 #include <mbedtls/platform.h>
 #include <mbedtls/ssl.h>
@@ -27,8 +28,7 @@
 
 #include "http_parser.h"
 #include "http_parser.c"
-
-#include "certs.h"
+#include <toaru/hashmap.h>
 
 #define SIZE 512
 #define BOUNDARY "------ToaruOSFetchUploadBoundary"
@@ -56,59 +56,41 @@ struct {
 	int calculate_output;
 	int slow_upload;
 	int machine_readable;
+	int finished;
 } fetch_options = {0};
 
-void parse_url(char * d, struct http_req * r) {
+int parse_url(char * d, struct http_req * r) {
 	if (strstr(d, "http://") == d) {
-
 		d += strlen("http://");
-
-		char * s = strstr(d, "/");
-		if (!s) {
-			strcpy(r->domain, d);
-			strcpy(r->path, "");
-		} else {
-			*s = 0;
-			s++;
-			strcpy(r->domain, d);
-			strcpy(r->path, s);
-		}
-		if (strstr(r->domain,":")) {
-			char * port = strstr(r->domain,":");
-			*port = '\0';
-			port++;
-			r->port = atoi(port);
-		} else {
-			r->port = 80;
-		}
+		r->port = 80;
 		r->ssl = 0;
 	} else if (strstr(d, "https://") == d) {
-
 		d += strlen("https://");
-
-		char * s = strstr(d, "/");
-		if (!s) {
-			strcpy(r->domain, d);
-			strcpy(r->path, "");
-		} else {
-			*s = 0;
-			s++;
-			strcpy(r->domain, d);
-			strcpy(r->path, s);
-		}
-		if (strstr(r->domain,":")) {
-			char * port = strstr(r->domain,":");
-			*port = '\0';
-			port++;
-			r->port = atoi(port);
-		} else {
-			r->port = 443;
-		}
+		r->port = 443;
 		r->ssl = 1;
 	} else {
-		fprintf(stderr, "sorry, can't parse %s\n", d);
-		exit(1);
+		fprintf(stderr, "Unrecognized protocol: %s\n", d);
+		return 1;
 	}
+
+	char * s = strstr(d, "/");
+	if (!s) {
+		strcpy(r->domain, d);
+		strcpy(r->path, "");
+	} else {
+		*s = 0;
+		s++;
+		strcpy(r->domain, d);
+		strcpy(r->path, s);
+	}
+	if (strstr(r->domain,":")) {
+		char * port = strstr(r->domain,":");
+		*port = '\0';
+		port++;
+		r->port = atoi(port);
+	}
+
+	return 0;
 }
 
 const char *DRBG_PERS = "ToaruOS Netboot";
@@ -120,20 +102,18 @@ static mbedtls_ssl_context _ssl;
 static mbedtls_ssl_config _ssl_conf;
 
 static int ssl_send(void * ctx, const unsigned char * buf, size_t len) {
-	FILE * f = ctx;
-	size_t out = fwrite(buf, 1, len, f);
-	fflush(f);
-	return out;
+	int * fd = ctx;
+	return write(*fd, buf, len);
 }
 
 
 static int ssl_recv(void * ctx, unsigned char * buf, size_t len) {
-	FILE * f = ctx;
-	return fread(buf, 1, len, f);
+	int * fd = ctx;
+	return read(*fd, buf, len);
 }
 
 
-static int ssl_handshake(struct http_req * r, FILE * socket) {
+static int ssl_handshake(struct http_req * r, int * socket) {
 	mbedtls_entropy_init(&_entropy);
 	mbedtls_ctr_drbg_init(&_ctr_drbg);
 	mbedtls_x509_crt_init(&_cacert);
@@ -143,19 +123,19 @@ static int ssl_handshake(struct http_req * r, FILE * socket) {
 	int ret;
 
 	if (mbedtls_ctr_drbg_seed(&_ctr_drbg, mbedtls_entropy_func, &_entropy, DRBG_PERS, sizeof(DRBG_PERS)) != 0) {
-		fprintf(stderr, "Failed to set seed?\n");
+		fprintf(stderr, "tls: Failed to set seed?\n");
 		return 1;
 	}
 
-	if (ret = mbedtls_x509_crt_parse(&_cacert, SSL_CA_PEM, sizeof(SSL_CA_PEM)) != 0) {
-		//fprintf(stderr, "Failed to parse %d certificate(s)\n", ret);
+	if (ret = mbedtls_x509_crt_parse_path(&_cacert, "/usr/share/ca-certificates") != 0) {
+		fprintf(stderr, "tls: warning: Failed to parse %d certificate(s)\n", ret);
 	}
 
 	if (mbedtls_ssl_config_defaults(&_ssl_conf,
 				MBEDTLS_SSL_IS_CLIENT,
 				MBEDTLS_SSL_TRANSPORT_STREAM,
 				MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
-		fprintf(stderr, "Error with SSL config defaults.\n");
+		fprintf(stderr, "tls: Error with SSL config defaults.\n");
 	}
 
 	mbedtls_ssl_conf_ca_chain(&_ssl_conf, &_cacert, NULL);
@@ -164,7 +144,7 @@ static int ssl_handshake(struct http_req * r, FILE * socket) {
 	mbedtls_ssl_conf_authmode(&_ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
 
 	if (mbedtls_ssl_setup(&_ssl, &_ssl_conf) != 0) {
-		fprintf(stderr, "Error with SSL config.\n");
+		fprintf(stderr, "tls: Error with SSL config.\n");
 	}
 
 	mbedtls_ssl_set_hostname(&_ssl, r->domain);
@@ -175,8 +155,7 @@ static int ssl_handshake(struct http_req * r, FILE * socket) {
 		ret = mbedtls_ssl_handshake(&_ssl);
 	} while (ret != 0 && (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE));
 	if (ret <0) {
-		fprintf(stderr, "Error with handshake: %d\n", ret);
-		fclose(socket);
+		fprintf(stderr, "tls: Error with handshake: %d\n", ret);
 		return 1;
 	}
 
@@ -209,12 +188,13 @@ void print_progress(int force) {
 			fprintf(stderr," %.2f Kbps", s);
 		}
 
-		if (fetch_options.content_length) {
+		if (!force && fetch_options.content_length) {
 			if (rate > 0.0) {
 				double remaining = (double)(fetch_options.content_length - fetch_options.size) / rate;
-
 				fprintf(stderr," (%.2f sec remaining)", remaining);
 			}
+		} else {
+			fprintf(stderr," (%.2f sec elapsed)", timediff);
 		}
 	}
 	fprintf(stderr,"\033[K\033[?25h");
@@ -272,6 +252,9 @@ int callback_body (http_parser *p, const char *buf, size_t len) {
 	print_progress(0);
 	if (fetch_options.machine_readable && fetch_options.content_length) {
 		fprintf(stdout,"%d %d\n",fetch_options.size, fetch_options.content_length);
+	}
+	if (fetch_options.content_length && fetch_options.content_length == fetch_options.size) {
+		fetch_options.finished = 1;
 	}
 	return 0;
 }
@@ -375,16 +358,11 @@ int main(int argc, char * argv[]) {
 		return 1;
 	}
 
-	FILE * f = fdopen(sock,"w+");
-
-	if (!f) {
-		fprintf(stderr, "Nope.\n");
-		return 1;
-	}
+	FILE * f_write = fdopen(sock,"w");
 
 	if (my_req.ssl) {
-		if (ssl_handshake(&my_req, f) > 0) {
-			fprintf(stderr, "TLS handshake failed.\n");
+		if (ssl_handshake(&my_req, &sock) > 0) {
+			fprintf(stderr, "tls: handshake failed.\n");
 			return 1;
 		}
 	}
@@ -444,7 +422,7 @@ int main(int argc, char * argv[]) {
 		if (my_req.ssl) {
 			mbedtls_ssl_write(&_ssl, buf, r);
 		} else {
-			fwrite(buf, 1, r, f);
+			fwrite(buf, 1, r, f_write);
 		}
 
 		while (!feof(in_file)) {
@@ -453,7 +431,7 @@ int main(int argc, char * argv[]) {
 			if (my_req.ssl) {
 				mbedtls_ssl_write(&_ssl, buf, r);
 			} else {
-				fwrite(buf, 1, r, f);
+				fwrite(buf, 1, r, f_write);
 			}
 			if (fetch_options.slow_upload) {
 				usleep(1000 * fetch_options.slow_upload); /* TODO fix terrible network stack; hopefully this ensures we send stuff right. */
@@ -466,8 +444,8 @@ int main(int argc, char * argv[]) {
 		if (my_req.ssl) {
 			mbedtls_ssl_write(&_ssl, buf, r);
 		} else {
-			fwrite(buf, 1, r, f);
-			fflush(f);
+			fwrite(buf, 1, r, f_write);
+			fflush(f_write);
 		}
 
 	} else if (fetch_options.cookie) {
@@ -482,8 +460,8 @@ int main(int argc, char * argv[]) {
 		if (my_req.ssl) {
 			mbedtls_ssl_write(&_ssl, buf, r);
 		} else {
-			fwrite(buf, 1, r, f);
-			fflush(f);
+			fwrite(buf, 1, r, f_write);
+			fflush(f_write);
 		}
 	} else {
 		char buf[1024];
@@ -496,8 +474,8 @@ int main(int argc, char * argv[]) {
 		if (my_req.ssl) {
 			mbedtls_ssl_write(&_ssl, buf, r);
 		} else {
-			fwrite(buf, 1, r, f);
-			fflush(f);
+			fwrite(buf, 1, r, f_write);
+			fflush(f_write);
 		}
 	}
 
@@ -511,16 +489,33 @@ int main(int argc, char * argv[]) {
 	http_parser_init(&parser, HTTP_RESPONSE);
 
 	gettimeofday(&fetch_options.start, NULL);
-	while (!feof(f)) {
-		char buf[10240];
-		memset(buf, 0, sizeof(buf));
-		size_t r;
+	while (1) {
+		if (fetch_options.finished) break;
+		char buf[4096] = {0};
+		ssize_t r;
 		if (!my_req.ssl) {
-			r = fread(buf, 1, 10240, f);
+			struct pollfd fds[1];
+			fds[0].fd = sock;
+			fds[0].events = POLLIN;
+			int ret = poll(fds,1,2000);
+			if (ret > 0 && fds[0].revents & POLLIN) {
+				r = read(sock, buf, 4096);
+				if (r == 0) {
+					break;
+				} else if (r < 0) {
+					fprintf(stderr, "fetch: read error: %d\n", r);
+				}
+			} else {
+				if (fetch_options.finished) break;
+				fprintf(stderr, "fetch: poll timed out: %d\n", ret);
+				continue;
+			}
 		} else {
-			r = mbedtls_ssl_read(&_ssl, buf, 10240);
-			if (r <= 0) {
+			r = mbedtls_ssl_read(&_ssl, buf, 4096);
+			if (r == 0) {
 				break;
+			} else if (r < 0) {
+				fprintf(stderr, "fetch: read error: %d\n", r);
 			}
 		}
 		http_parser_execute(&parser, &settings, buf, r);
