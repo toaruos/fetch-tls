@@ -503,7 +503,7 @@ int main(int argc, char * argv[]) {
 				if (r == 0) {
 					break;
 				} else if (r < 0) {
-					fprintf(stderr, "fetch: read error: %d\n", r);
+					fprintf(stderr, "fetch: read error: %zd\n", r);
 				}
 			} else {
 				if (fetch_options.finished) break;
@@ -512,10 +512,8 @@ int main(int argc, char * argv[]) {
 			}
 		} else {
 			r = mbedtls_ssl_read(&_ssl, buf, 4096);
-			if (r == 0) {
+			if (r <= 0) {
 				break;
-			} else if (r < 0) {
-				fprintf(stderr, "fetch: read error: %d\n", r);
 			}
 		}
 		http_parser_execute(&parser, &settings, buf, r);
